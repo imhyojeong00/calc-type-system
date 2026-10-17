@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>Calculator-Type System</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./app.css">
+</head>
+<body class="sources">
+  <div id="intro-veil"></div>
+
+  <header id="info">
+    <div id="info-1">TYPE A–Z · + =</div>
+    <div id="info-2">56 calculators · 1949 → 1980</div>
+    <div id="info-3"></div>
+  </header>
+
+  <div id="main-view">
+    <div id="world">
+      <div id="line"></div>
+    </div>
+  </div>
+  <div id="grain"></div>
+
+  <div id="ui-bar">
+    <div id="typed-display"></div>
+    <input id="key-capture" type="text" autocomplete="off" autocorrect="off"
+      autocapitalize="off" spellcheck="false" autofocus>
+    <div class="ui-sep"></div>
+    <button id="xray-btn" type="button" aria-pressed="false" data-ko="엑스레이">X-RAY</button>
+    <button id="receipt-btn" type="button" aria-pressed="true" data-ko="영수증">RECEIPT</button>
+    <button id="sources-btn" type="button" aria-pressed="true" data-ko="정보">INFO</button>
+    <button id="lang-btn" type="button" aria-label="한국어">KR</button>
+    <button id="sound-btn" type="button" aria-pressed="true" aria-label="sound">♪</button>
+    <button id="clear-btn" type="button" aria-label="clear">×</button>
+  </div>
+
+  <script src="./data.js"></script>
+  <script src="./app.js"></script>
+  <script src="./script.js"></script>
+</body>
+</html>
