@@ -3,20 +3,57 @@ const D = window.CALC_DATA, ADJ = window.SIZE_ADJUST || {};
 const C = {}; D.calcs.forEach((c) => (C[c.n] = c));
 const PAIR = {}; D.pairs.forEach((p) => (PAIR[p.letter] = p));
 
-const OVERLAP = 0.24;
+/* ─────────────────────────────────────────────────────────────
+   TYPING SYSTEM (final)
+   1. Body   : letter j  → calculator j+1      (oldest bodies, 1949 →)
+   2. Keys   : letter j  → calculator 56−j     (newest keys, ← 1980)
+   3. Dose   : English letter frequency decides how many keys a body gets.
+               Frequent letters are worn bare, rare letters pile keys up.
+               keys = sockets × dose
+   4. Graft  : 42% of the keys are pulled out of the previous composite
+               (its sockets go empty). "=" never grafts.
+   5. Overflow: keys beyond the socket count continue the keypad grid —
+               gaps inside the keypad first, then ring by ring over the body,
+               past the body's edge only when the body is full.
+   6. Line   : the genealogy line breaks — VOID letters leave a gap,
+               EXCESS letters climb onto the previous body and lift the line.
+   7. Error  : a letter typed twice in a row is copied wrong — the machine
+               imagines a calculator that never existed (left half of the body,
+               right half of the key donor) and captions it like a real one.
+   8. Tape   : printing calculators print the running sum of keys; "=" totals it.
+   9. Shed   : receipt tape drops after 3 letters, the body after 9 —
+               only the keys remain.
+   Uncertain dates are written with "?" (c1961 → 1961?, early 1950s → 195?).
+   Original and X-ray share the same layout; only the images change.
+   ───────────────────────────────────────────────────────────── */
+const FREQ = "ETAOINSHRDLCUMWFGYPBVKJXQZ";
+const TIERS = [
+  { en: "VOID",    ko: "공백", dose: 0 },
+  { en: "SPARSE",  ko: "결핍", dose: 0.2 },
+  { en: "EXACT",   ko: "정량", dose: 1 },
+  { en: "SURPLUS", ko: "잉여", dose: 1.8 },
+  { en: "EXCESS",  ko: "과잉", dose: 3.4 },
+];
+const TIER_OF = {};
+[...FREQ].forEach((L, i) => (TIER_OF[L] = i < 5 ? 0 : i < 10 ? 1 : i < 16 ? 2 : i < 21 ? 3 : 4));
+TIER_OF["+"] = 4; TIER_OF["="] = 2;
+const NO_GRAFT = new Set(["="]);
 const DONATE = 0.42;
-const SHED = { tape: 3, keys: Infinity, body: 9 };
-const MAT = { mech: { lift: 34, dip: 10, ms: 640 }, nixie: { lift: 24, dip: 5, ms: 430 }, crt: { lift: 18, dip: 4, ms: 380 }, hand: { lift: 12, dip: 2, ms: 260 } };
+const MAX_KEYS = 220;
+const OVERLAP = 0.24;
+const SHED = { tape: 3, body: 9 };
+const HIDE_AFTER = 60;
 
 const $ = (id) => document.getElementById(id);
 const lineEl = $("line"), world = $("world"), view = $("main-view");
 const typedEl = $("typed-display"), capture = $("key-capture");
 const info1 = $("info-1"), info2 = $("info-2"), info3 = $("info-3");
 
-let typed = "", comps = [], zoom = 1, panX = 0, panY = 0, xray = false, soundOn = true, receiptOn = true;
+let typed = "", comps = [], zoom = 1, panX = 0, panY = 0, xray = false, soundOn = true;
 let LANG = (() => { try { return localStorage.getItem("calc-lang") === "ko" ? "ko" : "en"; } catch (e) { return "en"; } })();
 const ko = (en, k) => (LANG === "ko" ? k : en);
 const shedLogged = new Set();
+let shedNote = "";
 
 const viewH = () => view.clientHeight || innerHeight;
 const pxPerCm = () => Math.min(innerWidth * 0.02, viewH() * 0.0245);
@@ -29,6 +66,7 @@ const keySrc = (n) => `${xray ? "keys_xray" : "keys"}/${pad(n)}.webp`;
 
 function rng(seed) { let s = seed >>> 0 || 1; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
 const hash = (str) => { let h = 2166136261; for (const ch of str) h = Math.imul(h ^ ch.charCodeAt(0), 16777619); return h >>> 0; };
+const shuffle = (arr, r) => { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; };
 
 const Snd = {
   ctx: null, nb: null, bn: null, bus: null, master: null, mf: null,
@@ -119,7 +157,7 @@ const Snd = {
   typeAt(t0, mat, nKeys, hasPaper, ex) {
     ex = ex || {}; this.lastTypeAt = t0; this.setProduction(0.3 + (ex.len || 1) * 0.045);
     this.tone(t0, 0.16, 85, 38, 0.55, "sine"); this.noise(t0, 0.05, "lowpass", 600, 0.7, 0.35);
-    const hits = clamp(Math.round(nKeys / 3.2), 7, 20); let t = t0 + 0.14;
+    const hits = nKeys ? clamp(Math.round(nKeys / 3.2), 4, 26) : 0; let t = t0 + 0.14;
     for (let i = 0; i < hits; i++) { this.strike(t, 0.55 + Math.random() * 0.6, mat); t += (0.62 / hits) * (0.45 + Math.random() * 1.1) * (Math.random() < 0.28 ? 0.4 : 1); }
     if (ex.receipt) this.receipt(t0 + 0.34, !!hasPaper);
   },
@@ -135,17 +173,18 @@ const Snd = {
   }
 };
 
-function keyEl(c, i, cls, cx, cy, boxW, boxH) {
+/* ── key element: one key cut from a donor atlas, fitted into a box ── */
+function keyEl(c, i, cx, cy, boxW, boxH, rot) {
   const k = c.keys[i], S0 = bodyW(c) / c.bw;
   const f = Math.min(boxW / (k[6] * S0), boxH / (k[7] * S0)) * 0.97;
   const S = S0 * f, w = k[6] * S, h = k[7] * S;
-  const el = document.createElement("div"); el.className = "key " + cls; el.dataset.n = c.n;
+  const el = document.createElement("div"); el.className = "key"; el.dataset.n = c.n;
   el.style.width = w + "px"; el.style.height = h + "px";
   el.style.backgroundImage = `url(${keySrc(c.n)})`;
   el.style.backgroundSize = `${c.at[0] * S}px ${c.at[1] * S}px`;
   el.style.backgroundPosition = `${-k[4] * S}px ${-k[5] * S}px`;
   el.style.left = cx - w / 2 + "px"; el.style.top = cy - h / 2 + "px";
-  el._i = i; el._cx = cx; el._cy = cy;
+  if (rot) el.style.rotate = rot + "deg";
   return el;
 }
 
@@ -160,156 +199,248 @@ function matchKeys(A, B) {
   return out;
 }
 
+/* ── uncertain years: every date the archive is not sure about reads with "?" ── */
+function yearOf(y) {
+  y = String(y || "");
+  let m = y.match(/^c\s?(\d{4})$/i); if (m) return m[1] + "?";
+  m = y.match(/(\d{3})\ds/); if (m) return m[1] + "?";
+  if (/^\d{4}$/.test(y)) return y;
+  if (/\d{3}\?/.test(y)) return y;
+  return "?";
+}
+const brandOf = (name) => name.split(" ")[0];
+const modelOf = (name) => name.split(" ").slice(1).pop() || name;
+
+/* ── layout: the genealogy line, and where it breaks ──
+   VOID letters leave a gap in the line.
+   EXCESS letters climb onto the previous body and lift the line.
+   Everything else sits back on the baseline.                      */
 function geometry(comp) {
   const b = C[comp.bodyN];
   comp.W = bodyW(b); comp.H = bodyH(b);
-  comp.A = { x: b.cx * comp.W, y: b.cy * comp.H };
-}
-
-function panelZoom() {
-  let mw = 1, mh = 1;
-  new Set(D.pairs.map((p) => p.body)).forEach((n) => { const b = C[n]; mw = Math.max(mw, bodyW(b)); mh = Math.max(mh, bodyH(b)); });
-  return Math.min(1, (innerWidth * 0.82) / mw, (viewH() * 0.80) / mh);
+  if (comp.fake) {
+    const k = C[comp.keysN], WB = comp.H * k.bw / k.bh;
+    comp.cutA = 0.5 * comp.W; comp.cutB = 0.5 * WB; comp.WB = WB;
+    comp.W = comp.cutA + (WB - comp.cutB);
+  }
 }
 function place(c, prev) {
-  if (xray) {
-    c.cx = prev ? prev.cx + ((prev.W + c.W) / 2) * (1 - OVERLAP) : 0;
-    c.left = c.cx - c.W / 2; c.top = -c.H;
-  } else {
-    const z = panelZoom(), PW = innerWidth / z, PH = viewH() / z;
-    const ang = c.idx * 2.399963, rad = (1 - Math.exp(-c.idx / 6)) * PW * 0.07;
-    let left = Math.cos(ang) * rad - c.A.x, top = Math.sin(ang) * rad * 0.75 - c.A.y;
-    left = clamp(left, -PW / 2 + PW * 0.04, PW / 2 - PW * 0.04 - c.W);
-    top = clamp(top, -PH / 2 + PH * 0.05, PH / 2 - PH * 0.07 - c.H);
-    c.left = left; c.top = top; c.cx = left + c.W / 2;
-  }
-  c.line = 0; c.anchor = { x: c.left + c.A.x, y: c.top + c.A.y };
-}
-function relayoutAll(glide) {
-  comps.forEach((c, i) => {
-    place(c, comps[i - 1]);
-    if (c.el) { c.el.style.transition = glide ? "left .7s cubic-bezier(.2,.8,.2,1), top .7s cubic-bezier(.2,.8,.2,1)" : "none"; c.el.style.left = c.left + "px"; c.el.style.top = c.top + "px"; }
-  });
+  const t = TIER_OF[c.letter];
+  if (!prev) { c.cx = 0; c.top = -c.H; }
+  else if (t === 0) { c.cx = prev.cx + (prev.W + c.W) / 2 + c.W * 0.22; c.top = -c.H; }
+  else if (t === 4) { c.cx = prev.cx + ((prev.W + c.W) / 2) * 0.5; c.top = prev.top + prev.H * 0.38 - c.H; }
+  else { c.cx = prev.cx + ((prev.W + c.W) / 2) * (1 - OVERLAP); c.top = -c.H; }
+  c.left = c.cx - c.W / 2;
 }
 
-function buildSlot(comp) {
+function bodyImage(n) { const im = new Image(); im.className = "body"; im.draggable = false; im.dataset.n = n; im.src = bodySrc(n); return im; }
+
+function buildBody(comp) {
   const b = C[comp.bodyN], k = C[comp.keysN];
-  const el = document.createElement("div"); el.className = "slot";
+  const el = document.createElement("div"); el.className = "slot" + (comp.fake ? " fake" : "");
   Object.assign(el.style, { left: comp.left + "px", top: comp.top + "px", width: comp.W + "px", height: comp.H + "px" });
-  const bw = document.createElement("div"); bw.className = "body-wrap";
-  const bi = new Image(); bi.className = "body"; bi.draggable = false; bi.dataset.n = b.n; bi.src = bodySrc(b.n); bw.appendChild(bi); el.appendChild(bw);
+  const bw = document.createElement("div"); bw.className = "body-wrap"; el.appendChild(bw);
+  const W = comp.W, H = comp.H;
+  const toSlot = (q, w, h, dx) => ({ cx: (q[0] + q[2] / 2) * w + dx, cy: (q[1] + q[3] / 2) * h, w: q[2] * w, h: q[3] * h });
 
-  const bk = b.keys || [], W = comp.W, H = comp.H;
-  comp.slots = bk.map((q) => ({ cx: (q[0] + q[2] / 2) * W, cy: (q[1] + q[3] / 2) * H, w: q[2] * W, h: q[3] * H }));
-  comp.slotEl = new Array(comp.slots.length).fill(null);
-  comp.native = [];
-  const kk = k.keys || [];
-  const pairs = matchKeys(kk.map((_, i) => relPos(k, i)), bk.map((_, j) => relPos(b, j)));
-  pairs.sort((p, q) => comp.slots[p[1]].cy - comp.slots[q[1]].cy || comp.slots[p[1]].cx - comp.slots[q[1]].cx);
-  pairs.forEach(([i, j], rank) => {
-    const sl = comp.slots[j], e = keyEl(k, i, "native", sl.cx, sl.cy, sl.w, sl.h);
-    e._rank = rank; e._donor = i; e._slot = j; comp.native[i] = e; comp.slotEl[j] = e; el.appendChild(e);
-  });
+  if (!comp.fake) {
+    const bi = bodyImage(b.n); bi.style.width = "100%"; bi.style.height = "100%"; bw.appendChild(bi);
+    comp.slots = (b.keys || []).map((q) => toSlot(q, W, H, 0));
+  } else {
+    /* a calculator that never existed: left half of the body, right half of the key donor */
+    const WA = bodyW(b), dxB = comp.cutA - comp.cutB;
+    const a = bodyImage(b.n); Object.assign(a.style, { position: "absolute", left: 0, top: 0, width: WA + "px", height: H + "px", clipPath: `inset(0 ${WA - comp.cutA}px 0 0)` });
+    const z = bodyImage(k.n); Object.assign(z.style, { position: "absolute", left: dxB + "px", top: 0, width: comp.WB + "px", height: H + "px", clipPath: `inset(0 0 0 ${comp.cutB}px)` });
+    bw.append(a, z);
+    comp.slots = [
+      ...(b.keys || []).map((q) => toSlot(q, WA, H, 0)).filter((s) => s.cx < comp.cutA),
+      ...(k.keys || []).map((q) => toSlot(q, comp.WB, H, dxB)).filter((s) => s.cx >= comp.cutA),
+    ];
+  }
 
   let paper = null;
   if (b.print || k.print) {
     paper = document.createElement("div"); paper.className = "paper";
-    const pw = clamp(comp.W * 0.2, 46, 130), ph = comp.H * 0.34;
-    Object.assign(paper.style, { width: pw + "px", height: ph + "px", left: comp.W / 2 - pw / 2 + "px", top: -ph + 8 + "px" });
+    const pw = clamp(W * 0.2, 46, 130), ph = H * 0.34;
+    Object.assign(paper.style, { width: pw + "px", height: ph + "px", left: W / 2 - pw / 2 + "px", top: -ph + 8 + "px", fontSize: clamp(pw * 0.11, 6, 11) + "px" });
     el.appendChild(paper);
   }
-  Object.assign(comp, { el, bodyImg: bi, paper, visitors: [] });
+  Object.assign(comp, { el, bodyWrap: bw, paper });
   lineEl.appendChild(el);
 }
 
-function transfer(prev, comp, animate) {
-  const pk = C[prev.keysN], b = C[comp.bodyN];
-  const alive = prev.native.map((e, i) => (e && !prev.gone.has(i) ? i : -1)).filter((i) => i >= 0);
-  const r = rng(hash(prev.letter + comp.letter + comps.length));
-  const pool = alive.slice(); for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-  const count = clamp(Math.round(alive.length * DONATE), Math.min(2, alive.length), Math.max(1, alive.length - 1));
-  const take = pool.slice(0, alive.length > 1 ? count : 0);
-  comp.takenFrom = prev.letter; comp.takenN = prev.keysN; comp.takenCount = 0;
-  if (!take.length || !comp.slots.length) return;
-  const pairs = matchKeys(take.map((i) => relPos(pk, i)), comp.slots.map((_, j) => relPos(b, j)));
-  pairs.sort((p, q) => comp.slots[p[1]].cy - comp.slots[q[1]].cy || comp.slots[p[1]].cx - comp.slots[q[1]].cx);
-  pairs.forEach(([ti, j], rank) => {
-    const i = take[ti], sl = comp.slots[j], e = keyEl(pk, i, "visitor", sl.cx, sl.cy, sl.w, sl.h), old = comp.slotEl[j];
-    comp.slotEl[j] = e; comp.visitors.push(e); comp.takenCount++; comp.el.appendChild(e);
-    if (old) comp.gone.add(old._donor);
-    if (animate) {
-      const d = 140 + rank * (24 + Math.random() * 10) + Math.random() * 50;
-      e.animate([{ transform: "translateY(-36px) scale(1.15)", opacity: 0, filter: "blur(4px)" }, { transform: "translateY(2px) scale(1)", opacity: 1, filter: "blur(0)", offset: 0.72 }, { transform: "none", opacity: 1, filter: "blur(0)" }],
-        { duration: 340, delay: d, easing: "cubic-bezier(.2,.9,.3,1)", fill: "backwards" });
-      if (old) { old.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 120, delay: d + 110, fill: "forwards" }); setTimeout(() => (old.style.display = "none"), d + 260); }
-    } else if (old) old.style.display = "none";
+/* receipt tape: prints the running calculation of everything typed so far */
+function printTape(comp) {
+  if (!comp.paper) return;
+  const rows = []; let sum = 0;
+  comps.forEach((c) => {
+    if (c.letter === "=") rows.push(["=", String(sum)]);
+    else { sum += c.items.length; rows.push([c.letter, "+" + c.items.length]); }
   });
+  comp.paper.innerHTML = "";
+  const body = document.createElement("div"); body.className = "tape";
+  rows.slice(-14).forEach(([a, v]) => { const r = document.createElement("div"); r.className = "row" + (a === "=" ? " total" : ""); r.innerHTML = `<span></span><span></span>`; r.children[0].textContent = a; r.children[1].textContent = v; body.appendChild(r); });
+  comp.paper.appendChild(body);
+}
+
+/* the most recent composite that still holds keys (VOID letters pass the lineage through) */
+function lineageDonor() {
+  for (let i = comps.length - 1; i >= 0; i--) if (comps[i].items.some((it) => !it.gone)) return comps[i];
+  return null;
 }
 
 function addComposite(L, animate) {
-  const pair = PAIR[L], prev = comps[comps.length - 1] || null;
-  const comp = { letter: L, pair, bodyN: pair.body, keysN: pair.keys, gone: new Set(), prevLetter: prev ? prev.letter : null };
-  comp.totalBefore = prev ? prevTotal(prev) : C[pair.keys].nk;
-  comp.idx = comps.length; geometry(comp); place(comp, prev); comps.push(comp); buildSlot(comp);
-  if (!prev) comp.totalBefore = total(comp);
-  if (prev) transfer(prev, comp, animate);
-  comp.total = total(comp);
-  if (animate) animateIn(comp, prev);
+  const pair = PAIR[L], tier = TIERS[TIER_OF[L]];
+  const prevInLine = comps[comps.length - 1] || null;
+  const donor = lineageDonor();
+  /* a letter typed twice in a row is copied wrong: the machine imagines a calculator that never existed */
+  const fake = !!prevInLine && prevInLine.letter === L && !prevInLine.fake;
+  const comp = { letter: L, pair, tier, fake, bodyN: pair.body, keysN: pair.keys, idx: comps.length, items: [], grafted: 0, graftFrom: null };
+  if (fake) { const b = C[pair.body], k = C[pair.keys]; comp.fakeName = `${brandOf(b.name)} ${modelOf(k.name)}`; comp.fakeYear = yearOf(b.year).slice(0, 3) + "?"; }
+  geometry(comp); place(comp, prevInLine); buildBody(comp); comps.push(comp);
+
+  const r = rng(hash(typed + "|" + comp.idx));
+  const S = comp.slots.length, own = C[pair.keys];
+  const N = tier.dose === 0 || !S ? 0 : Math.min(MAX_KEYS, Math.max(1, Math.round(S * tier.dose)));
+
+  /* sources: grafted keys from the lineage + the letter's own donor keys (cycled when exhausted) */
+  const src = [], taken = [];
+  if (N && donor && !NO_GRAFT.has(L)) {
+    const alive = shuffle(donor.items.filter((it) => !it.gone), r);
+    const g = Math.min(alive.length, Math.round(N * DONATE));
+    for (const it of alive.slice(0, g)) { src.push({ n: it.n, i: it.i, grafted: true }); taken.push(it); }
+    comp.grafted = g; comp.graftFrom = g ? donor.letter : null;
+  }
+  const ownIdx = own.keys.map((_, i) => i);
+  while (src.length < N && ownIdx.length) for (const i of shuffle(ownIdx.slice(), r)) { if (src.length >= N) break; src.push({ n: own.n, i, grafted: false }); }
+  shuffle(src, r);
+
+  /* layer 0: into the sockets, each key goes to the socket nearest its original position */
+  const first = src.slice(0, Math.min(S, src.length));
+  const xs = comp.slots.map((s) => s.cx), ys = comp.slots.map((s) => s.cy);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const slotRel = comp.slots.map((s) => [(s.cx - x0) / (x1 - x0 || 1), (s.cy - y0) / (y1 - y0 || 1)]);
+  const pairs = matchKeys(first.map((s) => relPos(C[s.n], s.i)), slotRel);
+  const placed = [];
+  pairs.forEach(([a, j]) => { const s = first[a], sl = comp.slots[j]; placed.push({ s, cx: sl.cx, cy: sl.cy, w: sl.w, h: sl.h, layer: 0, rot: 0 }); });
+
+  /* overflow: the keypad grid keeps growing.
+     Keys beyond the socket count go onto the same grid pitch as the keypad —
+     first into the gaps inside the keypad, then ring by ring outward over the body,
+     and only when the body is full do they grow past its edge. No tilting, no scatter. */
+  const rest = src.slice(first.length);
+  if (rest.length && S) {
+    const med = (a) => { const b = a.slice().sort((x, y) => x - y); return b[Math.floor(b.length / 2)] || 0; };
+    const sw = med(comp.slots.map((s) => s.w)), sh = med(comp.slots.map((s) => s.h));
+    const nn = (axis) => med(comp.slots.map((a) => {
+      let best = Infinity;
+      for (const b of comp.slots) {
+        if (a === b) continue;
+        const d = axis === "x" ? b.cx - a.cx : b.cy - a.cy, off = axis === "x" ? Math.abs(b.cy - a.cy) : Math.abs(b.cx - a.cx);
+        if (d > 0 && off < (axis === "x" ? a.h : a.w) * 0.5) best = Math.min(best, d);
+      }
+      return best;
+    }).filter(isFinite));
+    const px = clamp(nn("x") || sw * 1.2, sw * 1.02, sw * 2.2), py = clamp(nn("y") || sh * 1.2, sh * 1.02, sh * 2.2);
+    const bw = Math.min(sw, px * 0.94), bh = Math.min(sh, py * 0.94);
+    const nx = Math.round((x1 - x0) / px), ny = Math.round((y1 - y0) / py);
+    const occupied = (x, y) => comp.slots.some((s) => Math.abs(s.cx - x) < (px + s.w) * 0.42 && Math.abs(s.cy - y) < (py + s.h) * 0.42);
+    const inside = (x, y) => x - bw / 2 >= 0 && x + bw / 2 <= comp.W && y - bh / 2 >= 0 && y + bh / 2 <= comp.H;
+    const cells = [], seen = new Set();
+    const ccx = (x0 + x1) / 2, ccy = (y0 + y1) / 2;
+    const maxRing = 40;
+    for (let ring = 0; ring <= maxRing && cells.length < rest.length * 3; ring++) {
+      for (let j = -ring; j <= ny + ring; j++) for (let i = -ring; i <= nx + ring; i++) {
+        const onRing = ring === 0 || i === -ring || i === nx + ring || j === -ring || j === ny + ring;
+        const id = i + ":" + j; if (!onRing || seen.has(id)) continue; seen.add(id);
+        const x = x0 + i * px, y = y0 + j * py;
+        if (occupied(x, y)) continue;
+        cells.push({ x, y, ring, inBody: inside(x, y), d: Math.hypot((x - ccx) / px, (y - ccy) / py) });
+      }
+    }
+    /* inside the body first, nearest to the keypad first; outside the body only afterwards */
+    cells.sort((a, b) => (b.inBody - a.inBody) || a.ring - b.ring || a.d - b.d);
+    rest.forEach((s, m) => {
+      const c = cells[m]; if (!c) return;
+      placed.push({ s, cx: c.x, cy: c.y, w: bw, h: bh, layer: 1, rot: 0 });
+    });
+  }
+  placed.sort((p, q) => p.layer - q.layer || p.cy - q.cy || p.cx - q.cx);
+  placed.forEach((p, rank) => {
+    const e = keyEl(C[p.s.n], p.s.i, p.cx, p.cy, p.w, p.h, p.rot);
+    e.style.zIndex = 3 + p.layer; if (p.s.grafted) e.classList.add("grafted");
+    comp.el.appendChild(e);
+    comp.items.push({ n: p.s.n, i: p.s.i, el: e, gone: false, layer: p.layer, rank });
+  });
+
+  /* grafted keys leave their old sockets */
+  taken.forEach((it, x) => {
+    it.gone = true;
+    if (animate) setTimeout(() => { if (it.gone) it.el.style.display = "none"; }, 120 + x * 18); else it.el.style.display = "none";
+  });
+
+  printTape(comp);
+  if (animate) animateIn(comp);
   return comp;
 }
-const total = (c) => c.native.filter((e, i) => e && !c.gone.has(i)).length + c.visitors.length;
-const prevTotal = (p) => total(p);
 
+/* mechanical motion: stepped drop, keys appear one by one — no fades, no blur, no bounce */
 function animateIn(comp) {
-  const m = MAT[C[comp.bodyN].mat] || MAT.nixie;
-  comp.bodyImg.animate([{ transform: `translateY(${-m.lift}px)`, opacity: 0 }, { transform: `translateY(${m.dip}px)`, opacity: 1, offset: 0.62 }, { transform: "translateY(0)", opacity: 1 }], { duration: m.ms, easing: "cubic-bezier(.2,.8,.2,1)" });
-  const nk = comp.native.filter(Boolean).length;
-  comp.native.forEach((e) => { if (!e) return; e.animate([{ transform: "translateY(-16px)", opacity: 0, filter: "blur(3px)" }, { transform: "translateY(2px)", opacity: 1, filter: "blur(0)", offset: 0.72 }, { transform: "none", opacity: 1, filter: "blur(0)" }], { duration: 300, delay: m.ms * 0.45 + Math.min(520, e._rank * (520 / Math.max(nk, 1))), easing: "cubic-bezier(.2,.9,.3,1)", fill: "backwards" }); });
-  if (comp.paper) comp.paper.animate([{ clipPath: "inset(100% 0 0 0)" }, { clipPath: "inset(0 0 0 0)" }], { duration: 760, delay: m.ms * 0.6, easing: "steps(9,end)", fill: "backwards" });
-  try { Snd.type(C[comp.bodyN].mat, nk + comp.visitors.length, !!comp.paper, { receipt: receiptOn, len: typed.length }); }
+  const n = comp.items.length;
+  comp.bodyWrap.animate([{ transform: "translateY(-28px)" }, { transform: "translateY(0)" }], { duration: 220, easing: "steps(4, end)" });
+  const span = Math.min(1100, 260 + n * 9);
+  comp.items.forEach((it) => {
+    it.el.animate([{ visibility: "hidden" }, { visibility: "hidden" }], { duration: 1, delay: 180 + (it.rank / Math.max(n, 1)) * span, fill: "backwards" });
+  });
+  if (comp.paper) comp.paper.animate([{ clipPath: "inset(100% 0 0 0)" }, { clipPath: "inset(0 0 0 0)" }], { duration: 760, delay: 300, easing: "steps(9,end)", fill: "backwards" });
+  try { Snd.type(C[comp.bodyN].mat, n, !!comp.paper, { receipt: !!comp.paper, len: typed.length }); }
   catch (err) { console.warn(err); }
 }
 
-let shedNote = "";
 function refreshAges(logShed) {
   const n = comps.length, notes = [];
   comps.forEach((c, i) => {
-    const age = n - 1 - i, sTape = age >= SHED.tape, sKeys = age >= SHED.keys, sBody = xray && age >= SHED.body;
-    c.el.style.display = !xray && age >= 90 ? "none" : "";
-    c.el.classList.toggle("shed-tape", sTape); c.el.classList.toggle("shed-keys", sKeys); c.el.classList.toggle("shed-body", sBody);
-    c.native.forEach((e, ix) => { if (e && !c.gone.has(ix)) e.style.transitionDelay = sKeys ? (ix % 17) * 40 + "ms" : "0ms"; });
-    if (logShed) [["tape", sTape && c.paper, ko("receipt", "영수증")], ["keys", sKeys, ko("keys left on the body", "몸통에 남은 버튼")], ["body", sBody, ko("body (only the grafted keys remain)", "몸통(삽수 버튼만 남음)")]].forEach(([key, cond, name]) => {
-      const id = `${i}:${key}:${c.letter}`; if (cond && !shedLogged.has(id)) { shedLogged.add(id); notes.push(ko(`${c.letter} generation ${age}: ${name} shed`, `${c.letter} ${age}세대 ${name} 탈락`)); }
+    const age = n - 1 - i, sTape = age >= SHED.tape, sBody = age >= SHED.body;
+    c.el.style.display = age >= HIDE_AFTER ? "none" : "";
+    c.el.classList.toggle("shed-tape", sTape); c.el.classList.toggle("shed-body", sBody);
+    if (logShed) [["tape", sTape && c.paper, ko("receipt", "영수증")], ["body", sBody, ko("body", "몸체")]].forEach(([key, cond, name]) => {
+      const id = `${i}:${key}:${c.letter}`;
+      if (cond && !shedLogged.has(id)) { shedLogged.add(id); notes.push(ko(`${c.letter} lost its ${name}`, `${c.letter} ${name} 탈락`)); }
     });
   });
-  shedNote = notes.join(" · ");
+  if (logShed) shedNote = notes.join(" · ");
 }
 
 function camera(instant) {
   const last = comps[comps.length - 1]; world.classList.toggle("no-ease", !!instant);
-  if (!xray) {
-    const z = panelZoom() * zoom;
-    world.style.transform = `translate(${innerWidth * 0.5 + panX}px, ${viewH() * 0.48 + panY}px) scale(${z})`;
-    return;
-  }
-
   const ax = last ? last.left + last.W * 0.5 : 0;
   const ay = last ? last.top + last.H * 0.5 : -viewH() * 0.2;
-  const cxScreen = innerWidth * 0.5;
-  const fit = last ? Math.min(1, (viewH() * 0.76) / Math.max(last.H, 1), (innerWidth * 0.92) / Math.max(last.W, 1)) : 1;
+  const fit = last ? Math.min(1, (viewH() * 0.7) / Math.max(last.H, 1), (innerWidth * 0.9) / Math.max(last.W, 1)) : 1;
   const z = Math.min(zoom, fit);
-  world.style.transform = `translate(${cxScreen - z * ax + panX}px, ${viewH() * 0.5 - z * ay + panY}px) scale(${z})`;
+  world.style.transform = `translate(${innerWidth * 0.5 - z * ax + panX}px, ${viewH() * 0.52 - z * ay + panY}px) scale(${z})`;
 }
 
 function updateUI() {
   typedEl.textContent = typed; capture.value = typed; capture.setSelectionRange(typed.length, typed.length);
   const c = comps[comps.length - 1];
-  if (!c) { info1.textContent = ko("TYPE A–Z · + =", "A–Z · + = 입력"); info2.textContent = ko("56 calculators · 1949 → 1980", "계산기 56대 · 1949 → 1980"); info3.textContent = ""; return; }
-  const b = C[c.bodyN], k = C[c.keysN], prev = comps[comps.length - 2];
-  info1.textContent = `${b.name} × ${k.name}` + (c.visitors.length ? ` + ${C[c.takenN].name}` : "");
-  info2.textContent = `${ko("Combined objects", "접목된 사물")} · ${b.year} · ${k.year}` + (prev ? ` · ${ko(`${c.visitors.length} grafted keys`, `접목된 버튼 ${c.visitors.length}개`)}` : "");
-  info3.textContent = "";
+  if (!c) {
+    info1.textContent = ko("TYPE A–Z · + =", "A–Z · + = 를 입력하세요");
+    info2.textContent = ko("56 calculators, some of them unconfirmed · 194? → 1980", "계산기 56대, 일부는 확인되지 않음 · 194? → 1980");
+    info3.textContent = ko("Frequent letters wear their keys off. Rare letters pile them up.", "자주 쓰는 글자는 버튼이 닳아 없어지고, 드문 글자는 버튼이 쌓입니다.");
+    return;
+  }
+  const b = C[c.bodyN], k = C[c.keysN], t = c.tier, n = c.items.length, s = c.slots.length;
+  info1.textContent = `${c.letter} — ${ko(t.en, t.ko)} ×${t.dose}`;
+  /* the imagined calculator is captioned exactly like the real ones */
+  info2.textContent = c.fake
+    ? ko(`${c.fakeName} (${c.fakeYear})`, `${c.fakeName} (${c.fakeYear})`)
+    : ko(`body ${b.name} (${yearOf(b.year)}) × keys ${k.name} (${yearOf(k.year)})`, `몸체 ${b.name} (${yearOf(b.year)}) × 버튼 ${k.name} (${yearOf(k.year)})`);
+  let line = ko(`${n} keys / ${s} sockets`, `버튼 ${n}개 / 소켓 ${s}개`);
+  if (c.grafted) line += " · " + ko(`${c.grafted} grafted from ${c.graftFrom}`, `${c.graftFrom}에서 접목 ${c.grafted}개`);
+  if (shedNote) line += " · " + shedNote;
+  info3.textContent = line;
 }
+
 function typeChar(ch) {
   const L = ch.toUpperCase(); if (!PAIR[L]) return;
   const before = comps.length; typed += L; panX = panY = 0;
@@ -320,13 +451,14 @@ function typeChar(ch) {
     typed = typed.slice(0, -1); try { updateUI(); } catch (e2) {}
   }
 }
-function rebuildAll(keepTape) {
-  lineEl.innerHTML = ""; comps = []; shedLogged.clear();
-  const s = typed; typed = ""; for (const ch of s) { typed += ch; try { addComposite(ch, false); } catch (err) { console.error(err); typed = typed.slice(0, -1); } }
-  refreshAges(false); shedNote = ""; camera(true); updateUI();
+function rebuildAll() {
+  lineEl.innerHTML = ""; comps = []; shedLogged.clear(); shedNote = "";
+  const s = typed; typed = "";
+  for (const ch of s) { typed += ch; try { addComposite(ch, false); } catch (err) { console.error(err); typed = typed.slice(0, -1); } }
+  refreshAges(false); camera(true); updateUI();
 }
-function backspace() { if (!typed) return; typed = typed.slice(0, -1); rebuildAll(false); }
-function clearAll() { typed = ""; panX = panY = 0; rebuildAll(false); }
+function backspace() { if (!typed) return; typed = typed.slice(0, -1); rebuildAll(); }
+function clearAll() { typed = ""; panX = panY = 0; zoom = 1; rebuildAll(); }
 
 capture.addEventListener("keydown", (e) => {
   if (e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -336,48 +468,46 @@ capture.addEventListener("keydown", (e) => {
 capture.addEventListener("input", () => { capture.value = typed; });
 document.body.addEventListener("click", () => capture.focus());
 
+/* pan & zoom — both modes */
 let drag = null;
 const fingers = new Set();
-view.addEventListener("pointerdown", (e) => { fingers.add(e.pointerId); if (fingers.size > 1) { drag = null; return; } if (!xray) { capture.focus(); return; } drag = { x: e.clientX, y: e.clientY, px: panX, py: panY }; view.classList.add("dragging"); view.setPointerCapture(e.pointerId); capture.focus(); });
+view.addEventListener("pointerdown", (e) => { fingers.add(e.pointerId); if (fingers.size > 1) { drag = null; return; } drag = { x: e.clientX, y: e.clientY, px: panX, py: panY }; view.classList.add("dragging"); view.setPointerCapture(e.pointerId); capture.focus(); });
 view.addEventListener("pointermove", (e) => { if (!drag) return; panX = drag.px + e.clientX - drag.x; panY = drag.py + e.clientY - drag.y; camera(true); });
 const endDrag = (e) => { if (e && e.pointerId !== undefined) fingers.delete(e.pointerId); drag = null; view.classList.remove("dragging"); };
 view.addEventListener("pointerup", endDrag); view.addEventListener("pointercancel", endDrag);
 let pinch = null;
 const spread = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) || 1;
-view.addEventListener("touchstart", (e) => { if (xray && e.touches.length === 2) pinch = { d: spread(e.touches), z: zoom }; }, { passive: true });
+view.addEventListener("touchstart", (e) => { if (e.touches.length === 2) pinch = { d: spread(e.touches), z: zoom }; }, { passive: true });
 view.addEventListener("touchmove", (e) => { if (pinch && e.touches.length === 2) { zoom = clamp(pinch.z * (spread(e.touches) / pinch.d), 0.3, 2.6); camera(true); } }, { passive: true });
 view.addEventListener("touchend", (e) => { if (e.touches.length < 2) pinch = null; });
-view.addEventListener("wheel", (e) => { e.preventDefault(); if (!xray) return; zoom = clamp(zoom * Math.exp(-e.deltaY * 0.0012), 0.3, 2.6); camera(true); }, { passive: false });
+view.addEventListener("wheel", (e) => { e.preventDefault(); zoom = clamp(zoom * Math.exp(-e.deltaY * 0.0012), 0.3, 2.6); camera(true); }, { passive: false });
 
+/* X-ray: same layout, same keys — only the images are swapped */
 function setXray(on) {
   xray = on; document.body.classList.toggle("xray", on); $("xray-btn").setAttribute("aria-pressed", on);
   document.querySelectorAll("img.body").forEach((im) => (im.src = bodySrc(im.dataset.n)));
   document.querySelectorAll(".key").forEach((k) => (k.style.backgroundImage = `url(${keySrc(k.dataset.n)})`));
-  panX = panY = 0; zoom = 1; view.style.cursor = on ? "" : "default";
-  relayoutAll(true); refreshAges(false); camera(false);
   try { Snd.xray(on); } catch (err) { console.warn(err); }
 }
 $("xray-btn").addEventListener("click", (e) => { e.stopPropagation(); setXray(!xray); capture.focus(); });
-$("receipt-btn").addEventListener("click", (e) => {
-  e.stopPropagation(); receiptOn = !receiptOn;
-  document.body.classList.toggle("receipt-off", !receiptOn);
-  e.currentTarget.setAttribute("aria-pressed", receiptOn);
-  capture.focus();
-});
-$("sources-btn").addEventListener("click", (e) => { e.stopPropagation(); const on = !document.body.classList.contains("sources"); document.body.classList.toggle("sources", on); e.currentTarget.setAttribute("aria-pressed", on); setTimeout(() => rebuildAll(true), 30); capture.focus(); });
 $("sound-btn").addEventListener("click", (e) => { e.stopPropagation(); soundOn = !soundOn; e.currentTarget.setAttribute("aria-pressed", soundOn); try { Snd.setOn(soundOn); } catch (err) { console.warn(err); } capture.focus(); });
 $("clear-btn").addEventListener("click", (e) => { e.stopPropagation(); clearAll(); capture.focus(); });
-addEventListener("resize", () => rebuildAll(true));
+addEventListener("resize", () => rebuildAll());
 
+/* EN / KR */
 function applyLang() {
   document.documentElement.lang = LANG;
   document.querySelectorAll("[data-ko]").forEach((el) => {
     if (el.dataset.en === undefined) el.dataset.en = el.textContent;
     el.textContent = LANG === "ko" ? el.dataset.ko : el.dataset.en;
   });
+  document.querySelectorAll("[data-ko-label]").forEach((el) => {
+    if (el.dataset.enLabel === undefined) el.dataset.enLabel = el.getAttribute("aria-label") || "";
+    el.setAttribute("aria-label", LANG === "ko" ? el.dataset.koLabel : el.dataset.enLabel);
+  });
   const lb = $("lang-btn");
   lb.textContent = LANG === "ko" ? "EN" : "KR";
-  lb.setAttribute("aria-label", LANG === "ko" ? "English" : "한국어");
+  lb.setAttribute("aria-label", LANG === "ko" ? "Switch to English" : "한국어로 보기");
   updateUI();
 }
 $("lang-btn").addEventListener("click", (e) => {
@@ -394,9 +524,9 @@ $("lang-btn").addEventListener("click", (e) => {
 }, { passive: true, capture: true }));
 document.addEventListener("keydown", (e) => { if (e.key === "Tab") { e.preventDefault(); setXray(!xray); } });
 
-D.calcs.forEach((c, i) => setTimeout(() => { new Image().src = bodySrc(c.n); new Image().src = `keys/${pad(c.n)}.webp`; }, i * 40));
+D.calcs.forEach((c, i) => setTimeout(() => { new Image().src = `images/${pad(c.n)}.webp`; new Image().src = `keys/${pad(c.n)}.webp`; }, i * 40));
 setTimeout(() => D.calcs.forEach((c, i) => setTimeout(() => { new Image().src = `xray/${pad(c.n)}.webp`; new Image().src = `keys_xray/${pad(c.n)}.webp`; }, i * 70)), 3000);
-view.style.cursor = "default"; camera(true); applyLang();
+camera(true); applyLang();
 requestAnimationFrame(() => setTimeout(() => { $("intro-veil").classList.add("hide"); setTimeout(() => $("intro-veil").remove(), 1400); }, 200));
 capture.focus();
 })();
